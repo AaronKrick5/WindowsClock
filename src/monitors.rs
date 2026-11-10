@@ -1,5 +1,12 @@
 //! Monitor list and stable monitor identification.
 //! No Windows calls. The `win` module supplies the raw data.
+//!
+//! Identification rule:
+//! - A monitor is identified by its model code (manufacturer and product code
+//!   that the monitor reports, for example `gsm7727`).
+//! - The connector part of the hardware path can change when a cable is
+//!   disconnected and connected again. It is used only to tell two monitors
+//!   of the same model apart.
 
 use crate::geometry::Rect;
 
@@ -18,28 +25,38 @@ pub struct RawMonitor {
 pub struct DisplayTarget {
     /// Windows display name that this output shows.
     pub gdi_name: String,
-    /// Hardware device path of the monitor. Stable for the same monitor on the same connector.
+    /// Hardware device path of the monitor, for example
+    /// `\\?\DISPLAY#GSM7727#5&2cacaf54&0&UID512#{...}`.
     pub device_path: String,
-    /// Name from the monitor, for example `DELL U2723QE`. Can be empty.
+    /// Name from the monitor, for example `34GK950F`. Can be empty.
     pub friendly_name: String,
 }
 
-/// One monitor with a stable identifier.
+/// One connected monitor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Monitor {
-    /// Stable identifier. Used as the key in the settings file.
-    pub id: String,
+    /// Model code, lower case. Empty if Windows gave no hardware data.
+    pub model: String,
+    /// Connector part of the hardware path, lower case. Can change on a reconnect.
+    pub instance: String,
     /// Name to show to the user.
     pub name: String,
     pub rect: Rect,
     pub dpi: u32,
     pub primary: bool,
-    /// False if no hardware path was found. Such a monitor cannot be selected.
+    /// False if Windows gave no hardware data. Such a monitor cannot be
+    /// selected and never gets a clock.
     pub stable: bool,
 }
 
 impl Monitor {
-    /// Text for menus and questions, for example `DELL U2723QE (2560 x 1440)`.
+    /// Key that is unique in the list of connected monitors. Only valid
+    /// until the next display change. Never saved.
+    pub fn runtime_key(&self) -> String {
+        format!("{}|{}", self.model, self.instance)
+    }
+
+    /// Text for menus and questions, for example `34GK950F (3440 x 1440)`.
     pub fn label(&self) -> String {
         let main = if self.primary { ", main monitor" } else { "" };
         format!(
@@ -52,17 +69,43 @@ impl Monitor {
     }
 }
 
+/// Split a hardware device path into the model code and the connector part.
+///
+/// `\\?\DISPLAY#GSM7727#5&2cacaf54&0&UID512#{guid}` gives
+/// (`gsm7727`, `5&2cacaf54&0&uid512`).
+pub fn split_device_path(path: &str) -> Option<(String, String)> {
+    let lower = path.trim().to_ascii_lowercase();
+    let mut parts = lower.split('#');
+    let _prefix = parts.next()?;
+    let model = parts.next()?.trim();
+    let instance = parts.next().unwrap_or("").trim();
+    if model.is_empty() {
+        return None;
+    }
+    Some((model.to_string(), instance.to_string()))
+}
+
+/// Number of connected monitors with the given model code.
+pub fn count_model(monitors: &[Monitor], model: &str) -> usize {
+    monitors
+        .iter()
+        .filter(|m| m.stable && m.model == model)
+        .count()
+}
+
 /// Combine position data and hardware data into the monitor list.
 pub fn combine(raw: &[RawMonitor], targets: &[DisplayTarget]) -> Vec<Monitor> {
     let mut list: Vec<Monitor> = raw
         .iter()
         .map(|r| {
-            let target = targets.iter().find(|t| {
-                t.gdi_name.eq_ignore_ascii_case(&r.gdi_name) && !t.device_path.is_empty()
-            });
-            match target {
-                Some(t) => Monitor {
-                    id: t.device_path.to_ascii_lowercase(),
+            let found = targets
+                .iter()
+                .filter(|t| t.gdi_name.eq_ignore_ascii_case(&r.gdi_name))
+                .find_map(|t| split_device_path(&t.device_path).map(|ids| (t, ids)));
+            match found {
+                Some((t, (model, instance))) => Monitor {
+                    model,
+                    instance,
                     name: if t.friendly_name.trim().is_empty() {
                         short_name(&r.gdi_name)
                     } else {
@@ -74,7 +117,8 @@ pub fn combine(raw: &[RawMonitor], targets: &[DisplayTarget]) -> Vec<Monitor> {
                     stable: true,
                 },
                 None => Monitor {
-                    id: format!("unstable:{}", r.gdi_name.to_ascii_lowercase()),
+                    model: String::new(),
+                    instance: r.gdi_name.to_ascii_lowercase(),
                     name: short_name(&r.gdi_name),
                     rect: r.rect,
                     dpi: r.dpi,
@@ -107,6 +151,27 @@ mod tests {
     }
 
     #[test]
+    fn device_path_is_split() {
+        let (model, instance) = split_device_path(
+            r"\\?\DISPLAY#GSM7727#5&2cacaf54&0&UID512#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}",
+        )
+        .unwrap();
+        assert_eq!(model, "gsm7727");
+        assert_eq!(instance, "5&2cacaf54&0&uid512");
+        assert!(split_device_path("").is_none());
+        assert!(split_device_path(r"\\?\display").is_none());
+    }
+
+    #[test]
+    fn same_monitor_keeps_model_after_reconnect() {
+        // Values from a real log: the connector part changed from uid512 to uid516.
+        let before = split_device_path(r"\\?\display#gsm7727#5&2cacaf54&0&uid512#{x}").unwrap();
+        let after = split_device_path(r"\\?\display#gsm7727#5&2cacaf54&0&uid516#{x}").unwrap();
+        assert_eq!(before.0, after.0);
+        assert_ne!(before.1, after.1);
+    }
+
+    #[test]
     fn monitors_get_hardware_ids() {
         let raw = vec![
             RawMonitor {
@@ -136,16 +201,18 @@ mod tests {
         ];
         let list = combine(&raw, &targets);
         assert_eq!(list.len(), 2);
-        assert_eq!(list[0].id, r"\\?\display#xyz9999#5&2&0&uid2#{guid}");
+        assert_eq!(list[0].model, "xyz9999");
+        assert_eq!(list[0].instance, "5&2&0&uid2");
         assert_eq!(list[0].name, "DISPLAY1");
         assert!(list[0].stable);
         assert_eq!(list[1].name, "IPS Wide");
         assert_eq!(list[1].label(), "IPS Wide (2560 x 1440)");
         assert_eq!(list[0].label(), "DISPLAY1 (3840 x 1440, main monitor)");
+        assert_ne!(list[0].runtime_key(), list[1].runtime_key());
     }
 
     #[test]
-    fn monitor_without_hardware_path_is_not_stable() {
+    fn monitor_without_hardware_data_is_not_stable() {
         let raw = vec![RawMonitor {
             gdi_name: r"\\.\DISPLAY7".into(),
             rect: rect(0, 1920),
@@ -154,7 +221,8 @@ mod tests {
         }];
         let list = combine(&raw, &[]);
         assert!(!list[0].stable);
-        assert!(list[0].id.starts_with("unstable:"));
+        assert!(list[0].model.is_empty());
+        assert_eq!(count_model(&list, ""), 0);
     }
 
     #[test]

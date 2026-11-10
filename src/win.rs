@@ -37,17 +37,17 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, HWND_TOPMOST, IDC_ARROW, IDYES,
-    KillTimer, LoadCursorW, MA_NOACTIVATE, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK,
-    MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-    MONITORINFOF_PRIMARY, MSG, MessageBoxW, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
-    PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetTimer,
-    SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETTINGCHANGE,
-    WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    DispatchMessageW, FindWindowExW, FindWindowW, GetCursorPos, GetMessageW, GetWindowRect,
+    IDC_ARROW, IDYES, IsWindowVisible, KillTimer, LoadCursorW, MA_NOACTIVATE, MB_ICONINFORMATION,
+    MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MF_CHECKED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MONITORINFOF_PRIMARY, MSG, MessageBoxW, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMESUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow,
+    SetTimer, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP,
+    WM_SETTINGCHANGE, WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
@@ -80,6 +80,9 @@ const CLOCK_CLASS: PCWSTR = w!("WindowsClock.Clock");
 
 const TIMER_TICK: usize = 1;
 const TIMER_REBUILD: usize = 2;
+const TIMER_RETRY: usize = 3;
+/// Time between checks when Windows has no hardware data for a monitor.
+const RETRY_DELAY_MS: u32 = 1000;
 /// Display changes come in groups. Wait this long, then read the monitor list one time.
 const REBUILD_DELAY_MS: u32 = 300;
 
@@ -222,6 +225,15 @@ pub fn schedule_rebuild() {
     }
 }
 
+/// Ask for an `Event::Rebuild` after one second. Used to check again when
+/// Windows had no hardware data for a monitor.
+pub fn schedule_retry() {
+    if let Some(hwnd) = controller() {
+        // SAFETY: valid window handle, no callback function.
+        unsafe { SetTimer(Some(hwnd), TIMER_RETRY, RETRY_DELAY_MS, None) };
+    }
+}
+
 /// Ask for an `Event::Select` from the message loop.
 pub fn post_select_request() {
     if let Some(hwnd) = controller() {
@@ -241,9 +253,9 @@ unsafe extern "system" fn controller_proc(
             dispatch(Event::Tick);
             LRESULT(0)
         }
-        WM_TIMER if wparam.0 == TIMER_REBUILD => {
+        WM_TIMER if wparam.0 == TIMER_REBUILD || wparam.0 == TIMER_RETRY => {
             // SAFETY: valid window handle and timer identifier.
-            let _ = unsafe { KillTimer(Some(hwnd), TIMER_REBUILD) };
+            let _ = unsafe { KillTimer(Some(hwnd), wparam.0) };
             dispatch(Event::Rebuild);
             LRESULT(0)
         }
@@ -751,16 +763,12 @@ impl ClockWindow {
 
                     match updated {
                         Ok(()) => {
-                            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                            let _ = SetWindowPos(
-                                hwnd,
-                                Some(HWND_TOPMOST),
-                                0,
-                                0,
-                                0,
-                                0,
-                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                            );
+                            if !IsWindowVisible(hwnd).as_bool() {
+                                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                            }
+                            // The clock is never raised to the top here. A
+                            // raise would put it above the taskbar.
+                            place_below_taskbar(hwnd, monitor);
                             Ok(Rect {
                                 left: x,
                                 top: y,
@@ -783,6 +791,62 @@ impl ClockWindow {
             let _ = DeleteDC(dc);
             result
         }
+    }
+}
+
+/// Window class names of the Windows taskbar: main monitor and other monitors.
+/// These names are the same in all Windows 10 and Windows 11 versions. The
+/// program only reads the position of these windows. If the names change in
+/// a future Windows version, no taskbar is found and the window order of the
+/// clock is not changed.
+const TASKBAR_CLASSES: [PCWSTR; 2] = [w!("Shell_TrayWnd"), w!("Shell_SecondaryTrayWnd")];
+
+/// Find the taskbar window on the given monitor.
+fn taskbar_on_monitor(monitor: Rect) -> Option<HWND> {
+    for class in TASKBAR_CLASSES {
+        let mut previous: Option<HWND> = None;
+        // A limit, so that an unexpected window list cannot cause an endless loop.
+        for _ in 0..32 {
+            // SAFETY: valid class name. `previous` is a window from this same search.
+            let found = unsafe { FindWindowExW(None, previous, class, PCWSTR::null()) };
+            let Ok(hwnd) = found else { break };
+            if hwnd.0.is_null() {
+                break;
+            }
+            let mut r = RECT::default();
+            // SAFETY: valid window handle and pointer to a local structure.
+            if unsafe { GetWindowRect(hwnd, &mut r) }.is_ok() {
+                // A taskbar at the bottom edge has the full monitor width. Its
+                // top edge is inside the monitor, also when it is hidden
+                // (then only a thin line of it is on the monitor).
+                let same_width = r.left == monitor.left && r.right == monitor.right;
+                let top_inside = r.top >= monitor.top && r.top < monitor.bottom;
+                if same_width && top_inside {
+                    return Some(hwnd);
+                }
+            }
+            previous = Some(hwnd);
+        }
+    }
+    None
+}
+
+/// Put the clock directly below the taskbar of its monitor in the window
+/// order. The taskbar then covers the clock when the taskbar is in view.
+fn place_below_taskbar(clock: HWND, monitor: Rect) {
+    if let Some(taskbar) = taskbar_on_monitor(monitor) {
+        // SAFETY: both handles are valid windows. Position and size do not change.
+        let _ = unsafe {
+            SetWindowPos(
+                clock,
+                Some(taskbar),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        };
     }
 }
 

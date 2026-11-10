@@ -14,13 +14,18 @@ const MENU_EXIT: usize = 1;
 const MENU_SELECT: usize = 2;
 const MENU_HEADER: usize = 3;
 const MENU_MONITOR_BASE: usize = 100;
+/// Number of extra checks (one each second) when Windows gives no hardware
+/// data for a monitor.
+const MAX_RETRIES: u32 = 30;
 
 struct App {
     config: Config,
     config_path: PathBuf,
     monitors: Vec<Monitor>,
-    /// Clock windows, with the identifier of the monitor of each window.
+    /// Clock windows, with the runtime key of the monitor of each window.
     windows: Vec<(String, ClockWindow)>,
+    /// Number of extra checks made because Windows gave no hardware data.
+    retries: u32,
     /// Last monitor list that was written to the log.
     logged_layout: String,
 }
@@ -88,6 +93,7 @@ pub fn run() {
             config_path,
             monitors: Vec::new(),
             windows: Vec::new(),
+            retries: 0,
             logged_layout: String::new(),
         });
     });
@@ -145,7 +151,7 @@ fn show_menu() {
         id if id >= MENU_MONITOR_BASE => {
             if let Some(monitor) = monitors.get(id - MENU_MONITOR_BASE) {
                 with_app(|app| {
-                    let enabled = !app.config.is_enabled(&monitor.id);
+                    let enabled = !app.is_selected(monitor);
                     app.set_selection(&[(monitor.clone(), enabled)]);
                     app.rebuild();
                 });
@@ -190,6 +196,16 @@ fn ask_selection() {
 }
 
 impl App {
+    /// True if this connected monitor must show a clock.
+    fn is_selected(&self, monitor: &Monitor) -> bool {
+        monitor.stable
+            && self.config.is_enabled(
+                &monitor.model,
+                &monitor.instance,
+                monitors::count_model(&self.monitors, &monitor.model),
+            )
+    }
+
     fn refresh_monitors(&mut self) {
         self.monitors = monitors::combine(&win::raw_monitors(), &win::display_targets());
         let layout = self
@@ -197,15 +213,20 @@ impl App {
             .iter()
             .map(|m| {
                 format!(
-                    "[{} | id={} | {},{} {}x{} | dpi={} | selected={}]",
+                    "[{} | model={} | connector={} | {},{} {}x{} | dpi={} | selected={}]",
                     m.name,
-                    m.id,
+                    if m.stable {
+                        m.model.as_str()
+                    } else {
+                        "(no hardware data)"
+                    },
+                    m.instance,
                     m.rect.left,
                     m.rect.top,
                     m.rect.width(),
                     m.rect.height(),
                     m.dpi,
-                    self.config.is_enabled(&m.id)
+                    self.is_selected(m)
                 )
             })
             .collect::<Vec<_>>()
@@ -226,9 +247,24 @@ impl App {
         let wanted: Vec<String> = self
             .monitors
             .iter()
-            .filter(|m| m.stable && self.config.is_enabled(&m.id))
-            .map(|m| m.id.clone())
+            .filter(|m| self.is_selected(m))
+            .map(|m| m.runtime_key())
             .collect();
+
+        // Directly after a monitor is connected, Windows sometimes has no
+        // hardware data for it. No more notification comes when the data is
+        // ready, so check again after a short time.
+        if self.monitors.iter().any(|m| !m.stable) {
+            if self.retries < MAX_RETRIES {
+                self.retries += 1;
+                win::schedule_retry();
+            } else if self.retries == MAX_RETRIES {
+                self.retries += 1;
+                log("no hardware data for a monitor after all retries");
+            }
+        } else {
+            self.retries = 0;
+        }
 
         // Remove windows of monitors that are gone or not selected.
         // Dropping a window destroys it.
@@ -251,7 +287,7 @@ impl App {
     fn draw_all(&mut self) {
         let text = win::time_text();
         for (id, window) in &self.windows {
-            match self.monitors.iter().find(|m| &m.id == id) {
+            match self.monitors.iter().find(|m| m.runtime_key() == *id) {
                 Some(monitor) => {
                     if let Err(error) = window.draw(&text, monitor.rect, monitor.dpi) {
                         window.hide();
@@ -274,14 +310,18 @@ impl App {
     fn set_selection(&mut self, changes: &[(Monitor, bool)]) {
         let mut changed = false;
         for (monitor, enabled) in changes {
-            if self
-                .config
-                .set_enabled(&monitor.id, &monitor.name, *enabled)
-            {
+            let same_model = monitors::count_model(&self.monitors, &monitor.model);
+            if self.config.set_enabled(
+                &monitor.model,
+                &monitor.instance,
+                &monitor.name,
+                same_model,
+                *enabled,
+            ) {
                 changed = true;
                 log(&format!(
-                    "selection: {} ({}) = {}",
-                    monitor.name, monitor.id, enabled
+                    "selection: {} (model {}) = {}",
+                    monitor.name, monitor.model, enabled
                 ));
             }
         }
@@ -316,7 +356,7 @@ impl App {
             items.push(MenuItem {
                 id: MENU_MONITOR_BASE + index,
                 label: format!("Show clock on {}", monitor.label()),
-                checked: self.config.is_enabled(&monitor.id),
+                checked: self.is_selected(monitor),
                 enabled: monitor.stable,
                 separator: false,
             });
