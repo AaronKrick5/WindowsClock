@@ -6,9 +6,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Processor type that this build is for (for example `x86_64` or `aarch64`).
 pub const ARCH: &str = std::env::consts::ARCH;
 
-/// One short text for the M0 message window.
+/// Name of the development build.
+pub const BUILD_NAME: &str = "M1";
+
+/// One short text that identifies the build.
 pub fn summary() -> String {
-    format!("WindowsClock {VERSION} ({ARCH})\nBuild M0: build and download test.")
+    format!("WindowsClock {VERSION} ({ARCH}), build {BUILD_NAME}")
 }
 
 #[cfg(test)]
