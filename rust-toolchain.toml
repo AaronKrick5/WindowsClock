@@ -1,0 +1,5 @@
+# The compiler version is fixed so that each build is repeatable.
+# Update it on a schedule (see README).
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,68 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Each Monday 09:00 UTC: find new security advisories also when the code did not change.
+    - cron: "0 9 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Format and logic tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Show toolchain
+        run: rustup show
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Tests (code that does not use Windows)
+        run: cargo test --locked
+
+  components:
+    name: Security and license check of components
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x64
+            target: x86_64-pc-windows-msvc
+          - name: ARM64
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install toolchain and target
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+      - name: Lint
+        run: cargo clippy --locked --target ${{ matrix.target }} -- -D warnings
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Upload program
+        uses: actions/upload-artifact@v7
+        with:
+          name: WindowsClock-${{ matrix.name }}-${{ github.sha }}
+          path: target/${{ matrix.target }}/release/windowsclock.exe
+          if-no-files-found: error
+          retention-days: 30
