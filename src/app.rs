@@ -3,6 +3,7 @@
 
 use crate::buildinfo;
 use crate::config::{self, Config, Loaded};
+use crate::fullscreen;
 use crate::logging;
 use crate::monitors::{self, Monitor};
 use crate::win::{self, ClockWindow, Event, MenuItem};
@@ -13,17 +14,26 @@ const TITLE: &str = "WindowsClock";
 const MENU_EXIT: usize = 1;
 const MENU_SELECT: usize = 2;
 const MENU_HEADER: usize = 3;
+const MENU_FULLSCREEN: usize = 4;
 const MENU_MONITOR_BASE: usize = 100;
 /// Number of extra checks (one each second) when Windows gives no hardware
 /// data for a monitor.
 const MAX_RETRIES: u32 = 30;
 
+/// One clock window and its state.
+struct Clock {
+    /// Runtime key of the monitor of this window.
+    key: String,
+    window: ClockWindow,
+    /// True while a full-screen application is below the clock.
+    hidden_for_fullscreen: bool,
+}
+
 struct App {
     config: Config,
     config_path: PathBuf,
     monitors: Vec<Monitor>,
-    /// Clock windows, with the runtime key of the monitor of each window.
-    windows: Vec<(String, ClockWindow)>,
+    clocks: Vec<Clock>,
     /// Number of extra checks made because Windows gave no hardware data.
     retries: u32,
     /// Last monitor list that was written to the log.
@@ -74,6 +84,11 @@ pub fn run() {
         return;
     }
 
+    if !win::tray_add(TITLE) {
+        // Windows Explorer adds the icon later when it sends its start notification.
+        log("tray icon not added at start");
+    }
+
     let config_path = config::settings_path();
     let (config, first_start) = match Config::load(&config_path) {
         Loaded::Ok(config) => (config, false),
@@ -92,7 +107,7 @@ pub fn run() {
             config,
             config_path,
             monitors: Vec::new(),
-            windows: Vec::new(),
+            clocks: Vec::new(),
             retries: 0,
             logged_layout: String::new(),
         });
@@ -126,6 +141,13 @@ fn handle_event(event: Event) {
                 app.arm_timer();
             });
         }
+        Event::FullscreenCheck => {
+            with_app(|app| {
+                if app.update_fullscreen() {
+                    app.draw_all();
+                }
+            });
+        }
         Event::Menu => show_menu(),
         Event::Select => ask_selection(),
     }
@@ -148,6 +170,17 @@ fn show_menu() {
             win::quit();
         }
         MENU_SELECT => ask_selection(),
+        MENU_FULLSCREEN => {
+            with_app(|app| {
+                app.config.hide_on_fullscreen = !app.config.hide_on_fullscreen;
+                log(&format!(
+                    "option: hide for full-screen applications = {}",
+                    app.config.hide_on_fullscreen
+                ));
+                app.save();
+                app.rebuild();
+            });
+        }
         id if id >= MENU_MONITOR_BASE => {
             if let Some(monitor) = monitors.get(id - MENU_MONITOR_BASE) {
                 with_app(|app| {
@@ -190,7 +223,8 @@ fn ask_selection() {
         win::message_box(
             TITLE,
             "No monitor is selected, so no clock is shown.\n\n\
-             WindowsClock continues to run. To select a monitor, start WindowsClock again.",
+             WindowsClock continues to run. To select a monitor, use the WindowsClock \
+             icon in the notification area of the taskbar.",
         );
     }
 }
@@ -239,8 +273,8 @@ impl App {
 
     /// Read the monitor list again and make the clock windows agree with it.
     ///
-    /// Rule: a window exists only for a monitor that is connected, has a
-    /// stable identifier, and is selected in the settings.
+    /// Rule: a window exists only for a monitor that is connected, has
+    /// hardware data, and is selected in the settings.
     fn rebuild(&mut self) {
         self.refresh_monitors();
 
@@ -268,34 +302,82 @@ impl App {
 
         // Remove windows of monitors that are gone or not selected.
         // Dropping a window destroys it.
-        self.windows.retain(|(id, _)| wanted.contains(id));
+        self.clocks.retain(|clock| wanted.contains(&clock.key));
 
         // Add windows for newly wanted monitors.
-        for id in &wanted {
-            if !self.windows.iter().any(|(existing, _)| existing == id) {
+        for key in &wanted {
+            if !self.clocks.iter().any(|clock| clock.key == *key) {
                 match ClockWindow::create() {
-                    Ok(window) => self.windows.push((id.clone(), window)),
+                    Ok(window) => self.clocks.push(Clock {
+                        key: key.clone(),
+                        window,
+                        hidden_for_fullscreen: false,
+                    }),
                     Err(error) => log(&format!("cannot create clock window: {error}")),
                 }
             }
         }
 
+        // The regular full-screen check runs only when it is necessary.
+        win::set_fullscreen_timer(self.config.hide_on_fullscreen && !self.clocks.is_empty());
+        self.update_fullscreen();
         self.draw_all();
+    }
+
+    /// Check for each clock if a full-screen application is below it.
+    /// Returns true if the state of a clock changed.
+    fn update_fullscreen(&mut self) -> bool {
+        let mut changed = false;
+        if !self.config.hide_on_fullscreen {
+            for clock in &mut self.clocks {
+                if clock.hidden_for_fullscreen {
+                    clock.hidden_for_fullscreen = false;
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+        if self.clocks.is_empty() {
+            return false;
+        }
+        let windows = win::visible_windows();
+        for clock in &mut self.clocks {
+            let Some(monitor) = self.monitors.iter().find(|m| m.runtime_key() == clock.key) else {
+                continue;
+            };
+            let point = win::clock_point(monitor.rect, monitor.dpi);
+            let found = fullscreen::fullscreen_below(&windows, monitor.rect, point);
+            let hide = found.is_some();
+            if hide != clock.hidden_for_fullscreen {
+                clock.hidden_for_fullscreen = hide;
+                changed = true;
+                match found {
+                    Some(window) => log(&format!(
+                        "full-screen: hide clock on {} (window class {})",
+                        monitor.name, window.class_name
+                    )),
+                    None => log(&format!("full-screen: show clock on {}", monitor.name)),
+                }
+            }
+        }
+        changed
     }
 
     /// Draw the current time on all clock windows at their monitor positions.
     fn draw_all(&mut self) {
         let text = win::time_text();
-        for (id, window) in &self.windows {
-            match self.monitors.iter().find(|m| m.runtime_key() == *id) {
+        for clock in &self.clocks {
+            let monitor = self.monitors.iter().find(|m| m.runtime_key() == clock.key);
+            match monitor {
+                Some(_) if clock.hidden_for_fullscreen => clock.window.hide(),
                 Some(monitor) => {
-                    if let Err(error) = window.draw(&text, monitor.rect, monitor.dpi) {
-                        window.hide();
+                    if let Err(error) = clock.window.draw(&text, monitor.rect, monitor.dpi) {
+                        clock.window.hide();
                         log(&format!("draw failed on {}: {error}", monitor.name));
                     }
                 }
                 // No position is known for this window. Never show it.
-                None => window.hide(),
+                None => clock.window.hide(),
             }
         }
     }
@@ -304,6 +386,20 @@ impl App {
     fn arm_timer(&self) {
         // A small extra time makes sure that the minute has changed.
         win::set_tick_timer(win::ms_to_next_minute() + 20);
+    }
+
+    /// Write the settings file. Tell the user if this is not possible.
+    fn save(&mut self) {
+        match self.config.save(&self.config_path) {
+            Ok(()) => log("settings saved"),
+            Err(error) => {
+                log(&format!("cannot save settings: {error}"));
+                win::message_box(
+                    TITLE,
+                    &format!("WindowsClock cannot save the settings.\n\n{error}"),
+                );
+            }
+        }
     }
 
     /// Change the selection and save it immediately.
@@ -326,16 +422,7 @@ impl App {
             }
         }
         if changed {
-            match self.config.save(&self.config_path) {
-                Ok(()) => log("settings saved"),
-                Err(error) => {
-                    log(&format!("cannot save settings: {error}"));
-                    win::message_box(
-                        TITLE,
-                        &format!("WindowsClock cannot save the settings.\n\n{error}"),
-                    );
-                }
-            }
+            self.save();
         }
         // The log line with the monitor list contains the selection.
         self.logged_layout.clear();
@@ -363,12 +450,20 @@ impl App {
         }
         items.push(separator());
         items.push(MenuItem {
+            id: MENU_FULLSCREEN,
+            label: "Hide clock for full-screen applications".into(),
+            checked: self.config.hide_on_fullscreen,
+            enabled: true,
+            separator: false,
+        });
+        items.push(MenuItem {
             id: MENU_SELECT,
             label: "Ask for each monitor...".into(),
             checked: false,
             enabled: true,
             separator: false,
         });
+        items.push(separator());
         items.push(MenuItem {
             id: MENU_EXIT,
             label: "Exit".into(),

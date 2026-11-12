@@ -41,14 +41,23 @@ pub struct MonitorSetting {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub version: u32,
+    /// True if a clock hides when a full-screen application is below it.
+    /// The user can change this option.
+    #[serde(default = "default_true")]
+    pub hide_on_fullscreen: bool,
     #[serde(default)]
     pub monitors: Vec<MonitorSetting>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             version: CURRENT_VERSION,
+            hide_on_fullscreen: true,
             monitors: Vec::new(),
         }
     }
@@ -347,6 +356,15 @@ mod tests {
         assert!(c.is_enabled("gsm7727", "5&2cacaf54&0&uid512", 1));
         // A third connector value: both saved entries agree, so the clock shows.
         assert!(c.is_enabled("gsm7727", "5&2cacaf54&0&uid520", 1));
+    }
+
+    #[test]
+    fn full_screen_option_is_on_if_the_file_does_not_have_it() {
+        let c = Config::parse(r#"{"version": 2, "monitors": []}"#).unwrap();
+        assert!(c.hide_on_fullscreen);
+        let c = Config::parse(r#"{"version": 2, "hide_on_fullscreen": false, "monitors": []}"#)
+            .unwrap();
+        assert!(!c.hide_on_fullscreen);
     }
 
     #[test]

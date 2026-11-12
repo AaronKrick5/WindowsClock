@@ -4,7 +4,9 @@
 //! Only documented Windows interfaces are used. No code is injected into
 //! other programs and the taskbar is not changed.
 
+use crate::fullscreen::WindowInfo;
 use crate::geometry::{self, Rect};
+use crate::icon;
 use crate::monitors::{DisplayTarget, RawMonitor};
 use crate::render;
 use core::ffi::c_void;
@@ -21,13 +23,14 @@ use windows::Win32::Foundation::{
     COLORREF, ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Globalization::{GetTimeFormatEx, TIME_NOSECONDS};
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
-    BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, FW_SEMIBOLD,
-    GdiFlush, GetMonitorInfoW, GetTextExtentPoint32W, HDC, HGDIOBJ, HMONITOR, MONITORINFO,
-    MONITORINFOEXW, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
-    TextOutW,
+    BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleDC, CreateDIBSection,
+    CreateFontW, DEFAULT_CHARSET, DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors,
+    FW_SEMIBOLD, GdiFlush, GetMonitorInfoW, GetTextExtentPoint32W, HDC, HGDIOBJ, HMONITOR,
+    MONITORINFO, MONITORINFOEXW, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor,
+    TRANSPARENT, TextOutW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -35,19 +38,24 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
     SetProcessDpiAwarenessContext,
 };
+use windows::Win32::UI::Shell::{
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, FindWindowExW, FindWindowW, GetCursorPos, GetMessageW, GetWindowRect,
-    IDC_ARROW, IDYES, IsWindowVisible, KillTimer, LoadCursorW, MA_NOACTIVATE, MB_ICONINFORMATION,
-    MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MONITORINFOF_PRIMARY, MSG, MessageBoxW, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMRESUMESUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
-    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow,
-    SetTimer, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP,
-    WM_SETTINGCHANGE, WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW, FindWindowW, GWL_EXSTYLE,
+    GWL_STYLE, GetClassNameW, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongW,
+    GetWindowRect, HICON, ICONINFO, IDC_ARROW, IDYES, IsIconic, IsWindowVisible, KillTimer,
+    LoadCursorW, MA_NOACTIVATE, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND,
+    MB_TOPMOST, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MONITORINFOF_PRIMARY,
+    MSG, MessageBoxW, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PostMessageW, PostQuitMessage,
+    RegisterClassExW, RegisterWindowMessageW, SM_CXSMICON, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetTimer, SetWindowPos,
+    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP,
+    WM_SETTINGCHANGE, WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
@@ -67,6 +75,8 @@ pub enum Event {
     Menu,
     /// The user started the program a second time. Ask for the monitor selection.
     Select,
+    /// Time to check for full-screen applications below the clocks.
+    FullscreenCheck,
 }
 
 type Handler = fn(Event);
@@ -81,6 +91,9 @@ const CLOCK_CLASS: PCWSTR = w!("WindowsClock.Clock");
 const TIMER_TICK: usize = 1;
 const TIMER_REBUILD: usize = 2;
 const TIMER_RETRY: usize = 3;
+const TIMER_FULLSCREEN: usize = 4;
+/// Time between checks for full-screen applications.
+const FULLSCREEN_CHECK_MS: u32 = 1000;
 /// Time between checks when Windows has no hardware data for a monitor.
 const RETRY_DELAY_MS: u32 = 1000;
 /// Display changes come in groups. Wait this long, then read the monitor list one time.
@@ -89,6 +102,12 @@ const REBUILD_DELAY_MS: u32 = 300;
 const WM_APP_MENU: u32 = WM_APP + 1;
 const WM_APP_SELECT: u32 = WM_APP + 2;
 const WM_APP_REBUILD: u32 = WM_APP + 3;
+const WM_APP_TRAY: u32 = WM_APP + 4;
+
+/// Identifier of the tray icon of this program.
+const TRAY_ICON_ID: u32 = 1;
+static TRAY_ICON: AtomicIsize = AtomicIsize::new(0);
+static TRAY_TIP: OnceLock<String> = OnceLock::new();
 
 fn hwnd_from(value: isize) -> HWND {
     HWND(value as *mut c_void)
@@ -203,6 +222,7 @@ pub fn run_loop() {
 
 /// Stop the program.
 pub fn quit() {
+    tray_remove();
     if let Some(hwnd) = controller() {
         // SAFETY: the handle is the controller window of this thread.
         let _ = unsafe { DestroyWindow(hwnd) };
@@ -231,6 +251,20 @@ pub fn schedule_retry() {
     if let Some(hwnd) = controller() {
         // SAFETY: valid window handle, no callback function.
         unsafe { SetTimer(Some(hwnd), TIMER_RETRY, RETRY_DELAY_MS, None) };
+    }
+}
+
+/// Start or stop the regular `Event::FullscreenCheck`.
+pub fn set_fullscreen_timer(active: bool) {
+    if let Some(hwnd) = controller() {
+        // SAFETY: valid window handle and timer identifier, no callback function.
+        unsafe {
+            if active {
+                SetTimer(Some(hwnd), TIMER_FULLSCREEN, FULLSCREEN_CHECK_MS, None);
+            } else {
+                let _ = KillTimer(Some(hwnd), TIMER_FULLSCREEN);
+            }
+        }
     }
 }
 
@@ -283,7 +317,20 @@ unsafe extern "system" fn controller_proc(
             dispatch(Event::Select);
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == TIMER_FULLSCREEN => {
+            dispatch(Event::FullscreenCheck);
+            LRESULT(0)
+        }
+        WM_APP_TRAY => {
+            // The low part of `lparam` is the mouse or keyboard message on the icon.
+            let action = (lparam.0 as u32) & 0xFFFF;
+            if action == WM_RBUTTONUP || action == WM_LBUTTONUP || action == WM_CONTEXTMENU {
+                dispatch(Event::Menu);
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            tray_remove();
             CONTROLLER.store(0, Ordering::Relaxed);
             // SAFETY: always safe to call on the thread of the message loop.
             unsafe { PostQuitMessage(0) };
@@ -292,7 +339,8 @@ unsafe extern "system" fn controller_proc(
         _ => {
             let taskbar_created = TASKBAR_CREATED.load(Ordering::Relaxed);
             if taskbar_created != 0 && msg == taskbar_created {
-                // Windows Explorer started again.
+                // Windows Explorer started again. The tray icon is gone: add it again.
+                tray_show();
                 schedule_rebuild();
                 return LRESULT(0);
             }
@@ -335,6 +383,191 @@ unsafe extern "system" fn clock_proc(
         // SAFETY: the arguments are the unchanged arguments of this call.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tray icon (Windows notification area)
+// ---------------------------------------------------------------------------
+
+/// Make the program icon from calculated pixels. No icon file is necessary.
+fn create_program_icon() -> Option<HICON> {
+    // SAFETY: the bitmaps are valid until they are deleted at the end. The
+    // pixel copy has the exact size of the bitmap memory.
+    unsafe {
+        let size = GetSystemMetrics(SM_CXSMICON).clamp(16, 64);
+        let pixels = icon::clock_icon(size as usize);
+
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size,
+                biHeight: -size,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let color = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        if bits.is_null() {
+            let _ = DeleteObject(HGDIOBJ::from(color));
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, pixels.len());
+
+        // A mask bitmap is necessary, but the transparency comes from the
+        // color bitmap. One bit for each pixel, rows have an even byte count.
+        let mask_row_bytes = (size as usize).div_ceil(16) * 2;
+        let mask_bits = vec![0u8; mask_row_bytes * size as usize];
+        let mask = CreateBitmap(size, size, 1, 1, Some(mask_bits.as_ptr() as *const c_void));
+
+        let icon_info = ICONINFO {
+            fIcon: BOOL(1),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask,
+            hbmColor: color,
+        };
+        let icon = CreateIconIndirect(&icon_info).ok();
+        let _ = DeleteObject(HGDIOBJ::from(color));
+        let _ = DeleteObject(HGDIOBJ::from(mask));
+        icon
+    }
+}
+
+fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    let mut data = NOTIFYICONDATAW {
+        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        ..Default::default()
+    };
+    let icon = TRAY_ICON.load(Ordering::Relaxed);
+    if icon != 0 {
+        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        data.hIcon = HICON(icon as *mut c_void);
+    } else {
+        data.uFlags = NIF_MESSAGE | NIF_TIP;
+    }
+    data.uCallbackMessage = WM_APP_TRAY;
+    if let Some(tip) = TRAY_TIP.get() {
+        // The text field has a fixed size. Keep one place for the end mark.
+        for (target, source) in data.szTip.iter_mut().take(127).zip(tip.encode_utf16()) {
+            *target = source;
+        }
+    }
+    data
+}
+
+/// Show the tray icon. Returns false if Windows did not accept it (for
+/// example when Windows Explorer does not run at this moment).
+fn tray_show() -> bool {
+    let Some(hwnd) = controller() else {
+        return false;
+    };
+    if TRAY_ICON.load(Ordering::Relaxed) == 0
+        && let Some(icon) = create_program_icon()
+    {
+        TRAY_ICON.store(icon.0 as isize, Ordering::Relaxed);
+    }
+    let data = tray_data(hwnd);
+    // SAFETY: `data` is a complete structure with the correct size field.
+    unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool()
+}
+
+/// Add the tray icon with the given text. A click on the icon gives an
+/// `Event::Menu`. The icon is added again automatically after a Windows
+/// Explorer restart.
+pub fn tray_add(tip: &str) -> bool {
+    let _ = TRAY_TIP.set(tip.to_string());
+    tray_show()
+}
+
+/// Remove the tray icon.
+pub fn tray_remove() {
+    if let Some(hwnd) = controller() {
+        let data = tray_data(hwnd);
+        // SAFETY: `data` is a complete structure with the correct size field.
+        let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Other windows (for the full-screen check)
+// ---------------------------------------------------------------------------
+
+unsafe extern "system" fn collect_window(hwnd: HWND, data: LPARAM) -> BOOL {
+    // SAFETY: `data` is the pointer to the vector that `visible_windows`
+    // passes. The vector lives until `EnumWindows` returns.
+    let list = unsafe { &mut *(data.0 as *mut Vec<HWND>) };
+    list.push(hwnd);
+    // A limit, so that an unexpected window list cannot use much memory.
+    BOOL::from(list.len() < 4000)
+}
+
+/// Visible top-level windows of other programs, in window order from top to
+/// bottom. Only position, style, and class name are read.
+pub fn visible_windows() -> Vec<WindowInfo> {
+    let mut handles: Vec<HWND> = Vec::new();
+    // SAFETY: the callback only uses the vector pointer during this call.
+    unsafe {
+        let _ = EnumWindows(
+            Some(collect_window),
+            LPARAM(&mut handles as *mut Vec<HWND> as isize),
+        );
+    }
+
+    let mut list = Vec::new();
+    for hwnd in handles {
+        // SAFETY: all calls only read data of a window handle. If the window
+        // was closed in the meantime, the calls fail and the window is skipped.
+        unsafe {
+            if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+                continue;
+            }
+            // Click-through overlay windows are not applications.
+            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            if ex_style & WS_EX_TRANSPARENT.0 != 0 {
+                continue;
+            }
+            // "Cloaked" windows exist but Windows does not show them.
+            let mut cloaked = 0u32;
+            let cloak_known = DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                &mut cloaked as *mut u32 as *mut c_void,
+                size_of::<u32>() as u32,
+            )
+            .is_ok();
+            if cloak_known && cloaked != 0 {
+                continue;
+            }
+            let mut class_buffer = [0u16; 128];
+            let length = GetClassNameW(hwnd, &mut class_buffer).max(0) as usize;
+            let class_name = String::from_utf16_lossy(&class_buffer[..length.min(128)]);
+            if class_name.starts_with("WindowsClock.") {
+                continue;
+            }
+            let mut r = RECT::default();
+            if GetWindowRect(hwnd, &mut r).is_err() || r.right <= r.left || r.bottom <= r.top {
+                continue;
+            }
+            let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+            list.push(WindowInfo {
+                rect: Rect {
+                    left: r.left,
+                    top: r.top,
+                    right: r.right,
+                    bottom: r.bottom,
+                },
+                has_caption: style & WS_CAPTION.0 == WS_CAPTION.0,
+                class_name,
+            });
+        }
+    }
+    list
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +846,13 @@ const PADDING_X: i32 = 10;
 const PADDING_Y: i32 = 4;
 /// Opacity of the dark background behind the text (0 to 255).
 const BACKGROUND_ALPHA: u8 = 170;
+
+/// A point that is always inside the clock window of the given monitor.
+/// Used to find the window that is below the clock.
+pub fn clock_point(monitor: Rect, dpi: u32) -> (i32, i32) {
+    let inset = geometry::scale(MARGIN + PADDING_Y, dpi);
+    (monitor.right - inset, monitor.bottom - inset)
+}
 
 /// One clock window. The window is destroyed when this value is dropped.
 pub struct ClockWindow {
