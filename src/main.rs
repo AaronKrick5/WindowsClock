@@ -1,6 +1,6 @@
 //! WindowsClock: a clock overlay for Windows 11.
 //!
-//! Build M1: a clock window on each selected monitor. The selection is saved.
+//! Build M2: tray icon, and an option to hide the clock for full-screen applications.
 
 // No console window on Windows.
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -11,7 +11,9 @@
 
 mod buildinfo;
 mod config;
+mod fullscreen;
 mod geometry;
+mod icon;
 mod logging;
 mod monitors;
 mod render;

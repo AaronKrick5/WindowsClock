@@ -7,7 +7,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const ARCH: &str = std::env::consts::ARCH;
 
 /// Name of the development build.
-pub const BUILD_NAME: &str = "M1b";
+pub const BUILD_NAME: &str = "M2";
 
 /// One short text that identifies the build.
 pub fn summary() -> String {

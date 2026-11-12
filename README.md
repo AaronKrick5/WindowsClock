@@ -3,7 +3,7 @@
 A small clock overlay for Windows 11. It shows a clock that is always visible on the
 monitors you select, and on no other monitor.
 
-Status: early development. Build M1 shows a clock on the monitors you select and saves the selection. Position, appearance, and format settings come in later builds.
+Status: early development. Build M2 shows a clock on the monitors you select, has a tray icon with a menu, and can hide the clock for full-screen applications. Appearance and format settings come in later builds.
 
 ## Why
 
